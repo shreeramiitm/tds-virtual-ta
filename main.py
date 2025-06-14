@@ -88,7 +88,10 @@ def search_typesense_vector(query_vector, top_k=TOP_K):
         ]
     }
     response = typesense_client.multi_search.perform(search_parameters)
-    return response["results"][0]["hits"]
+    try:
+        return response["results"][0].get("hits", [])
+    except (KeyError, IndexError):
+        return []
 
 
 
