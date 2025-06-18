@@ -9,9 +9,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from azure.ai.inference import ChatCompletionsClient
-from azure.ai.inference.models import SystemMessage, UserMessage
-from azure.core.credentials import AzureKeyCredential
+
 
 load_dotenv()
 
@@ -26,7 +24,7 @@ NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 NOMIC_MODEL = "nomic-embed-text-v1.5"
 
 
-COLLECTION_NAME = "tds_chunks"
+COLLECTION_NAME = "tds_index_embed_chunks"
 TOP_K = 5
 EMBED_DIM = 768
 
@@ -88,14 +86,7 @@ def search_typesense_vector(query_vector, top_k=TOP_K):
         ]
     }
     response = typesense_client.multi_search.perform(search_parameters)
-    try:
-        return response["results"][0].get("hits", [])
-    except (KeyError, IndexError):
-        return []
-
-
-
-
+    return response["results"][0]["hits"]
 
 
 
@@ -154,6 +145,38 @@ def parse_llm_response(raw_text: str):
     except:
         return {"answer": raw_text.strip(), "links": []}
 
+
+def describe_image_with_gemini(img_bytes: bytes) -> str:
+    import base64
+    mime_type = "image/webp"  # You can infer dynamically if needed
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    prompt = "Please describe this image relevant to a data science student query."
+
+    response = requests.post(
+        AIPIPE_URL,
+        headers={
+            "Authorization": f"Bearer {AIPIPE_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": AIPIPE_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mime_type};base64,{img_b64}"
+                        }}
+                    ]
+                }
+            ]
+        },
+        timeout=60
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
 # --- MAIN API ---
 
 
@@ -174,28 +197,36 @@ async def rag_answer(
         if not question and not image:
             raise HTTPException(status_code=400, detail="No question or image provided.")
 
+        # Describe image if provided
+        if image:
+            img_bytes = await image.read()
+            image_desc = describe_image_with_gemini(img_bytes)
+            print("Image Description:", image_desc)
+            question = (question or "") + f"\n\nImage Context:\n{image_desc}"
+
+        print("Final question after appending image context:\n", question)
+
         # Embed and search
         embedding = embed_with_nomic(question)
         chunks = search_typesense_vector(embedding, top_k=TOP_K)
         prompt = build_prompt(question, chunks)
 
-        # Call AI Pipe API
+        # Call AI Pipe API (Gemini)
         response = requests.post(
-            "https://aipipe.org/openrouter/v1/chat/completions",
+            AIPIPE_URL,
             headers={
-                "Authorization": f"Bearer {os.getenv('AIPIPE_TOKEN')}",
+                "Authorization": f"Bearer {AIPIPE_TOKEN}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": "google/gemini-2.0-flash-lite-001",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
+                "model": AIPIPE_MODEL,
+                "messages": [{"role": "user", "content": prompt}]
             },
-            timeout=30
+            timeout=60
         )
         response.raise_for_status()
         raw_text = response.json()["choices"][0]["message"]["content"]
+        print("Raw Gemini Response:\n", raw_text)
 
         return JSONResponse(content=parse_llm_response(raw_text))
 
@@ -203,10 +234,6 @@ async def rag_answer(
         traceback.print_exc()
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
-
-
-
+    uvicorn.run("app:app", host="0.0.0.0", port=10000)
